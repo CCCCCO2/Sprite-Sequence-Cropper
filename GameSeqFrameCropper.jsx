@@ -21,6 +21,15 @@ var manualCropSettings=
     faceLeft : true
 };
 
+var fixedCenterCropSettings=
+{
+    pivotX : 0,
+    needCropTop : true,
+    needCropBottom : true,
+    needDrawGuideLine : true,
+};
+
+
 // ===================== UI 界面 =====================
 var win = new Window("dialog", "使锚点居中的裁剪");
 win.orientation = "column";
@@ -33,6 +42,9 @@ var manualCropSettingsGroup = allGroups.add("group", undefined, "");
 manualCropSettingsGroup.orientation = "column";
 var bipedAutoCropSettingsGroup = allGroups.add("group", undefined, "");
 bipedAutoCropSettingsGroup.orientation = "column";
+var fixedCenterCropGroup = allGroups.add("group", undefined, "");
+fixedCenterCropGroup.orientation = "column";
+	
 // 下拉菜单 onChange 方法
 whichInfo.onChange = function () {
     if (this.selection != null) {
@@ -47,6 +59,8 @@ var item = whichInfo.add ("item", "手动选区裁剪");
 item.group = manualCropSettingsGroup;
 item = whichInfo.add ("item", "自动裁剪(直立类生物)");
 item.group = bipedAutoCropSettingsGroup;
+item = whichInfo.add ("item", "固定中心线裁剪");
+item.group = fixedCenterCropGroup;
 // 默认为“手动选区裁剪”菜单
 whichInfo.selection = whichInfo.items[0];
 
@@ -402,6 +416,80 @@ saveAllOpenedDocumentButton.onClick = function()
     }
 };
 
+
+// ===================== 下拉菜单：固定中心线裁剪 =====================
+
+// 锚点x坐标
+var inputFixedCenterGroup = fixedCenterCropGroup.add("group");
+inputFixedCenterGroup.add("statictext", undefined, "中心锚点:");
+var inputFixedCenterGroup_FG = inputFixedCenterGroup.add("edittext", [0, 0, 50, 20], fixedCenterCropSettings.pivotX);
+
+// 其它 Toggle
+var needDrawGuideLineCheckbox_FG = fixedCenterCropGroup.add("checkbox", undefined, "绘制出参考线");
+var neddCropTopCheckbox_FG= fixedCenterCropGroup.add("checkbox", undefined, "裁剪顶部空白");
+var neddCropBottomCheckbox_FG = fixedCenterCropGroup.add("checkbox", undefined, "裁剪底部空白");
+needDrawGuideLineCheckbox_FG.value = true;
+neddCropTopCheckbox_FG.value = true;
+neddCropBottomCheckbox_FG.value = true;
+
+// 裁剪当前文档 Button
+var cropCurrentDocumentButton_FG = fixedCenterCropGroup.add("button", undefined, "裁剪当前文档");
+cropCurrentDocumentButton_FG.onClick = function() 
+{
+    if (!SyncFixedCenterCropSettingsParameters()) return;
+    if (app.documents.length === 0) 
+    {
+        alert("没有打开任何文档，请先打开文档再进行裁剪");
+        return;
+    }
+
+    var doc = app.activeDocument;
+    CropByFixedPivot(doc, fixedCenterCropSettings.pivotX);
+};
+
+// 裁剪所有打开文档 Button
+var cropAllOpenedDocumentButton = fixedCenterCropGroup.add("button", undefined, "裁剪所有打开文档");
+cropAllOpenedDocumentButton.onClick = function() 
+{
+    if (!SyncFixedCenterCropSettingsParameters()) return;
+    if (app.documents.length === 0) 
+    {
+        alert("没有打开任何文档，请先打开文档再进行裁剪");
+        return;
+    }
+
+    var docs = app.documents;
+    for (var i = 0; i < docs.length; i++) {
+        var doc = docs[i];
+        app.activeDocument = doc;
+        CropByFixedPivot(doc, fixedCenterCropSettings.pivotX);
+    }
+};
+
+// 保存所有打开文档 Button
+var saveAllOpenedDocumentButton = fixedCenterCropGroup.add("button", undefined, "保存所有打开文档（覆盖）");
+saveAllOpenedDocumentButton.onClick = function() 
+{
+    if (app.documents.length === 0) 
+    {
+        alert("没有打开任何文档，无需保存");
+        return;
+    }
+    
+    if (!confirm("确定要覆盖保存所有文档吗？")) return;
+    var docs = app.documents;
+    // 遍历每一个文档
+    for (var i = 0; i < docs.length; i++) {
+        var doc = docs[i]; // 当前文档
+        // 激活当前文档
+        app.activeDocument = doc;
+        SaveDocument(doc);
+    }
+};
+
+
+// ===================== 通用UI =====================
+
 // 关闭 Button
 var closeButton = win.add("button", undefined, "关闭");
 closeButton.onClick = function() {
@@ -441,6 +529,24 @@ function SyncManualCropSettingsParameters()
     manualCropSettings.needExportCSVFile = needExportCSVFileCheckbox_MG.value;
     manualCropSettings.needHorizontalScaling = needHorizontalScalingCheckbox_MG.value;
     manualCropSettings.needVerticalScaling= needVerticalScalingCheckbox_MG.value;
+}
+// 同步固定中心线裁剪的参数
+function SyncFixedCenterCropSettingsParameters()
+{
+    fixedCenterCropSettings.needCropTop = needDrawGuideLineCheckbox_FG.value;
+    fixedCenterCropSettings.needCropBottom = neddCropTopCheckbox_FG.value;
+    fixedCenterCropSettings.needDrawGuideLine = neddCropBottomCheckbox_FG.value;    
+    
+    var userInput = inputFixedCenterGroup_FG.text;
+    var integerInput = parseInt(userInput, 10);
+
+    if (!isNaN(integerInput) && userInput>=0 ) {
+        fixedCenterCropSettings.pivotX = integerInput;
+        return true;
+    } else {
+        alert("请输入有效的非负整数");
+        return false;
+    }
 }
 
 // 获取选取中心点
@@ -551,7 +657,7 @@ function ManualCropCurrentDocument(doc)
 }
 
 // 自动裁剪当前文档（直立类生物）
-function BipedAutoCropCurrentDocument(doc, csvFile) 
+function BipedAutoCropCurrentDocument(doc) 
 {
     // 获取当前文档宽度和高度
     var docWidth = doc.width;
@@ -679,6 +785,7 @@ function BipedAutoCropCurrentDocument(doc, csvFile)
 
     cropRegion = [finalCropLeftPosition, finalCropToptPosition, finalCropRightPosition, finalCropBottomPosition];
 
+/*
     var centerX = (finalCropLeftPosition + finalCropRightPosition) * 0.5;
     var centerY = (finalCropToptPosition + finalCropBottomPosition) * 0.5;
     
@@ -689,9 +796,64 @@ function BipedAutoCropCurrentDocument(doc, csvFile)
         offsetY = -offsetY;
     }
     csvFile.writeln(doc.name + "," + centerX  + "," + centerY + "," + offsetX + "," + offsetY);
-    
+*/
     // 设置裁剪区域
     doc.crop(cropRegion, cropAngle);
+}
+
+// 已知中心锚点，裁剪当前文档
+function CropByFixedPivot(doc, pivotX)
+{
+    // 获取当前文档宽度和高度
+    var docWidth = doc.width;
+    var docHeight = doc.height;
+
+    // 获取当前图层
+    var currentLayer = doc.activeLayer;
+
+    // 图层的边界最大位置
+    var currentLayerBounds = currentLayer.bounds;
+    var currentLayerLeft = currentLayerBounds[0].value;
+    var currentLayerRight = currentLayerBounds[2].value;
+    var currentLayerTop = currentLayerBounds[1].value;
+    var currentLayerBottom = currentLayerBounds[3].value;
+    var currentLayerLeftMinPosition = Math.max(0, currentLayerLeft);
+    var currentLayerRightMaxPosition = Math.min(docWidth, currentLayerRight);
+    var currentLayerTopMinPositon = Math.max(0, currentLayerTop);
+    var currentLayerBottomMaxPosition = Math.min(docHeight, currentLayerBottom);
+
+    // 添加最大边界位置的参考线
+    if(fixedCenterCropSettings.needDrawGuideLine)
+    {
+        var guideLeftMincrop = doc.guides.add(Direction.VERTICAL, new UnitValue(currentLayerLeftMinPosition, "px"));  // 添加最左侧参考线
+        var guideRightMaxcrop = doc.guides.add(Direction.VERTICAL, new UnitValue(currentLayerRightMaxPosition, "px")); // 添加最右侧参考线
+        if(fixedCenterCropSettings.needCropTop)
+        {
+            var guideTopMincrop = doc.guides.add(Direction.HORIZONTAL, new UnitValue(currentLayerTopMinPositon, "px")); // 添加最上方参考线
+        }
+        if(fixedCenterCropSettings.needCropBottom)
+        {
+            var guideBottomMaxcrop = doc.guides.add(Direction.HORIZONTAL, new UnitValue(currentLayerBottomMaxPosition, "px"));    // 添加最下方参考线
+        }
+    }
+
+    var leftDistance = Math.abs(pivotX - currentLayerLeftMinPosition);
+    var rightDistance = Math.abs(currentLayerRightMaxPosition - pivotX);
+    var halfWidth = Math.max(leftDistance, rightDistance);
+    var cropLeft = pivotX - halfWidth;
+    var cropRight = pivotX + halfWidth;
+    var cropTop = 0;
+    if(fixedCenterCropSettings.needCropTop)
+    {
+        cropTop = currentLayerTopMinPositon;
+    }
+    var cropBottom = docHeight;
+    if(fixedCenterCropSettings.needCropBottom)
+    {
+        cropBottom = currentLayerBottomMaxPosition;
+    }
+
+    doc.crop([cropLeft, cropTop, cropRight, cropBottom], 0);
 }
 
 // 保存文档
