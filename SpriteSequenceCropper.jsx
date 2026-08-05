@@ -6,6 +6,8 @@ var globalSettings=
     customFirstFramePivotX : 0,
     customLastFramePivotX : 0,
     needAutoCrop: true,
+    needFixedPivotCrop: false,
+    fixedPivotX: 0,
     isBottomCenter : true,
     toleranceOfBottom : 5,
     faceLeft : true,
@@ -42,9 +44,11 @@ var cropModePanel = win.add("panel", undefined, "裁剪模式");
 cropModePanel.orientation = "row";
 var autoCropRadio = cropModePanel.add("radiobutton", undefined, "自动裁剪");
 var manualCropRadio = cropModePanel.add("radiobutton", undefined, "手动裁剪");
+var fixedPivotCropRadio = cropModePanel.add("radiobutton", undefined, "统一锚点裁剪");
 autoCropRadio.value = true;
 autoCropRadio.helpTip = "自动裁剪方式将根据底部/顶部中心扩展指定范围，根据这个局部范围的中心作为该帧整张图片裁剪后的中心横坐标。该方式可适用于直立行走类生物的动作序列帧的裁剪";
 manualCropRadio.helpTip = "手动裁剪方式必须对每帧（除了首尾帧且对应启用指定了锚点的帧）进行手动选区，该选区的中心点即为裁剪后图片的中心点";
+fixedPivotCropRadio.helpTip = "所有打开文档都使用同一个水平锚点进行对称裁剪；启用后忽略首帧和尾帧锚点设置";
 
 // 自动裁剪设置
 var autoCropSettingsGroup = win.add("panel", undefined, "自动裁剪设置");
@@ -64,15 +68,24 @@ needHorizontalScalingCheckbox.value = true;
 var needVerticalScalingCheckbox = manualCropSettingsGroup.add("checkbox", undefined, "垂直方向扩展");
 needVerticalScalingCheckbox.value = true;
 
+// 统一锚点裁剪设置
+var fixedPivotCropSettingsGroup = win.add("panel", undefined, "统一锚点裁剪设置");
+var fixedPivotInputGroup = fixedPivotCropSettingsGroup.add("group");
+fixedPivotInputGroup.add("statictext", undefined, "所有帧中心锚点 X:");
+var fixedPivotXInputField = fixedPivotInputGroup.add("edittext", [0, 0, 60, 20], globalSettings.fixedPivotX);
+fixedPivotXInputField.helpTip = "支持非负整数或 0.5 步进，例如 92 或 92.5";
+
 function RefreshCropModeUI()
 {
     autoCropSettingsGroup.enabled = autoCropRadio.value;
     manualCropSettingsGroup.enabled = manualCropRadio.value;
+    fixedPivotCropSettingsGroup.enabled = fixedPivotCropRadio.value;
 }
 
 RefreshCropModeUI();
 autoCropRadio.onClick = RefreshCropModeUI;
 manualCropRadio.onClick = RefreshCropModeUI;
+fixedPivotCropRadio.onClick = RefreshCropModeUI;
 
 // 写入csv
 var csvExportSettingsGroup = win.add("panel", undefined, "CSV导出设置");
@@ -93,16 +106,22 @@ var cropAllOpenedDocumentButton = win.add("button", undefined, "裁剪所有打�
 cropAllOpenedDocumentButton.onClick = function() 
 {
     if (!SyncParameters()) return;
-    
-    var docs = app.documents;
-    var documentCount = docs.length;
+
+    var documentCount = app.documents.length;
     if (documentCount === 0) 
     {
         alert("没有打开任何文档，请先打开文档再进行裁剪");
         return;
     }
 
-    var csvFile;
+    // 固定文档顺序，避免处理过程中直接依赖动态 Documents 集合
+    var docs = [];
+    for (var docIndex = 0; docIndex < documentCount; docIndex++)
+        docs.push(app.documents[docIndex]);
+
+    if (!ValidateDocumentsBeforeCrop(docs)) return;
+
+    var csvFile = null;
     if(globalSettings.needExportCSVFile)
     {
         // 打开或创建CSV文件
@@ -113,60 +132,63 @@ cropAllOpenedDocumentButton.onClick = function()
             return;
         }
         csvFile = new File(folder.fsName + "/offsets.csv");
-        var fileExists = csvFile.exists;
-        csvFile.open("a");  // 追加打开文件，如果不存在则自动创建
-        if (!fileExists) 
+        csvFile.encoding = "UTF-8";
+        if (!csvFile.open("w"))
         {
-            csvFile.writeln("文件名,中心点X,中心点Y,偏移量X,偏移量Y");
+            alert("无法创建CSV文件: " + csvFile.error);
+            return;
         }
+        // UTF-8 BOM 便于 Excel 正确识别中文
+        csvFile.write("\uFEFF");
+        csvFile.writeln("文件名,中心点X,中心点Y,偏移量X,偏移量Y");
     }
 
-    // 遍历所有文档进行处理
-    var preCenter = null;
-    for (var i = 0; i < documentCount; i++)
+    var previousRulerUnits = app.preferences.rulerUnits;
+    try
     {
-        var doc = docs[i];
-        app.activeDocument = doc;
-        
-        var isFirstDocument = (i == 0);
-        var isLastDocument = (i > 0  && i == documentCount - 1);
+        // 所有 bounds、参考线和 crop 参数都统一按像素计算
+        app.preferences.rulerUnits = Units.PIXELS;
 
-        if (globalSettings.needCustomFirstFramePivotX && isFirstDocument)
+        var preCenter = null;
+        for (var i = 0; i < documentCount; i++)
         {
-            // 首帧特殊处理
-            preCenter = CropByFixedPivot(doc, globalSettings.customFirstFramePivotX, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
-        }
-        else if (globalSettings.needCustomLastFramePivotX && isLastDocument)
-        {
-            // 尾帧特殊处理
-            preCenter = CropByFixedPivot(doc, globalSettings.customLastFramePivotX, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
-        }
-        else
-        {
-            // 中间帧处理
-            if(globalSettings.needAutoCrop)
+            var doc = docs[i];
+            app.activeDocument = doc;
+            var isFirstDocument = (i == 0);
+            var isLastDocument = (i == documentCount - 1);
+
+            // 统一锚点模式优先于首尾帧的单独设置
+            if (globalSettings.needFixedPivotCrop)
             {
-                // 自动裁剪
+                preCenter = CropByFixedPivot(doc, globalSettings.fixedPivotX, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
+            }
+            else if (globalSettings.needCustomFirstFramePivotX && isFirstDocument)
+            {
+                preCenter = CropByFixedPivot(doc, globalSettings.customFirstFramePivotX, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
+            }
+            else if (globalSettings.needCustomLastFramePivotX && isLastDocument)
+            {
+                preCenter = CropByFixedPivot(doc, globalSettings.customLastFramePivotX, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
+            }
+            else if(globalSettings.needAutoCrop)
+            {
                 preCenter = BipedAutoCropCurrentDocument(doc, globalSettings.isBottomCenter, globalSettings.toleranceOfBottom, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
             }
             else
             {
-                // 手动框选选区裁剪
-                try{
-                    var bounds = doc.selection.bounds;
-                }
-                catch (e) {
-                    alert("未启用自动裁剪，需要手动框选所有帧的选区。但文档 " + doc.name + " 的选区不存在，请先手动框选选区");
-                    return;
-                }
                 preCenter = ManualCropCurrentDocument(doc, globalSettings.needHorizontalScaling, globalSettings.needVerticalScaling, globalSettings.needExportCSVFile, csvFile, preCenter, globalSettings.faceLeft, globalSettings.needDrawGuideLine);
             }
         }
     }
-    // 写入结束，关闭文件
-    if (csvFile) 
-        csvFile.close();
-
+    catch (e)
+    {
+        alert("裁剪失败: " + e.message + (e.line ? "\n行号: " + e.line : ""));
+    }
+    finally
+    {
+        app.preferences.rulerUnits = previousRulerUnits;
+        if (csvFile && csvFile.opened) csvFile.close();
+    }
 }
 
 // 保存所有打开文档 Button
@@ -210,38 +232,53 @@ function SyncParameters()
     globalSettings.needCustomFirstFramePivotX= useCustomFirstFramePivotCheckbox.value;
     if(useCustomFirstFramePivotCheckbox.value)
     {
-        var integerInput = parseInt(customFirstFramePivotXInputField.text, 10);
-        if (!isNaN(integerInput) && integerInput>=0 ) {
-            globalSettings.customFirstFramePivotX = integerInput;
+        var pivotInput = ParseNonNegativeHalfPixelNumber(customFirstFramePivotXInputField.text);
+        if (pivotInput !== null) {
+            globalSettings.customFirstFramePivotX = pivotInput;
         } 
         else {
-            alert("首帧锚点中心请输入有效的非负数值");
+            alert("首帧锚点中心请输入非负整数或以 0.5 为步进的小数，例如 92 或 92.5");
             return false;
         }
     }
     globalSettings.needCustomLastFramePivotX= useCustomLastFramePivotCheckbox.value;
     if(useCustomLastFramePivotCheckbox.value)
     {
-        var integerInput = parseInt(customLastFramePivotXInputField.text, 10);
-        if (!isNaN(integerInput) && integerInput>=0 ) {
-            globalSettings.customLastFramePivotX = integerInput;
+        var pivotInput = ParseNonNegativeHalfPixelNumber(customLastFramePivotXInputField.text);
+        if (pivotInput !== null) {
+            globalSettings.customLastFramePivotX = pivotInput;
         } 
         else {
-            alert("尾帧锚点中心请输入有效的非负数值");
+            alert("尾帧锚点中心请输入非负整数或以 0.5 为步进的小数，例如 92 或 92.5");
             return false;
         }
     }
     
     globalSettings.needAutoCrop = autoCropRadio.value;
+    globalSettings.needFixedPivotCrop = fixedPivotCropRadio.value;
     globalSettings.isBottomCenter = radio1.value;
     if(autoCropRadio.value)
     {
-        var integerInput = parseInt(toleranceInputField.text, 10);
-        if (!isNaN(integerInput) && integerInput>=0 ) {
+        var integerInput = ParseNonNegativeInteger(toleranceInputField.text);
+        if (integerInput !== null && integerInput > 0) {
             globalSettings.toleranceOfBottom = integerInput;
         } 
         else {
-            alert("底部/顶部范围请输入有效的非负数值");
+            alert("底部/顶部范围请输入有效的正整数");
+            return false;
+        }
+    }
+
+    if(fixedPivotCropRadio.value)
+    {
+        var fixedPivotInput = ParseNonNegativeHalfPixelNumber(fixedPivotXInputField.text);
+        if (fixedPivotInput !== null)
+        {
+            globalSettings.fixedPivotX = fixedPivotInput;
+        }
+        else
+        {
+            alert("所有帧中心锚点 X 请输入非负整数或以 0.5 为步进的小数，例如 92 或 92.5");
             return false;
         }
     }
@@ -253,6 +290,80 @@ function SyncParameters()
     globalSettings.needVerticalScaling = needVerticalScalingCheckbox.value;
     
     return true;
+}
+
+function ParseNonNegativeInteger(text)
+{
+    var normalized = String(text).replace(/^\s+|\s+$/g, "");
+    if (!/^\d+$/.test(normalized)) return null;
+    var value = Number(normalized);
+    return isFinite(value) ? value : null;
+}
+
+
+// 处理非负和半像素数值
+function ParseNonNegativeHalfPixelNumber(text)
+{
+    // 像素边界位于整数坐标，锚点允许位于像素边界或两个像素之间，因此支持 0.5 步进
+    var normalized = String(text).replace(/^\s+|\s+$/g, "");
+    if (!/^(?:\d+)(?:\.\d+)?$/.test(normalized)) return null;
+    var value = Number(normalized);
+    if (!isFinite(value) || value < 0) return null;
+    // 限制其它小数可确保以锚点对称扩展后，裁剪边界仍落在整数像素坐标上
+    return Math.round(value * 2) == value * 2 ? value : null;
+}
+
+// 在修改任何文档前完成可预见的检查，避免批处理中途才发现错误
+function ValidateDocumentsBeforeCrop(docs)
+{
+    var previousRulerUnits = app.preferences.rulerUnits;
+    try
+    {
+        app.preferences.rulerUnits = Units.PIXELS;
+        for (var i = 0; i < docs.length; i++)
+        {
+            var doc = docs[i];
+            app.activeDocument = doc;
+            var isFirstDocument = (i == 0);
+            var isLastDocument = (i == docs.length - 1);
+            var usesFirstPivot = globalSettings.needCustomFirstFramePivotX && isFirstDocument;
+            var usesLastPivot = !usesFirstPivot && globalSettings.needCustomLastFramePivotX && isLastDocument;
+
+            if (globalSettings.needFixedPivotCrop && globalSettings.fixedPivotX > doc.width.value)
+            {
+                alert("文档 " + doc.name + " 的统一锚点超出画布宽度");
+                return false;
+            }
+            if (!globalSettings.needFixedPivotCrop && usesFirstPivot && globalSettings.customFirstFramePivotX > doc.width.value)
+            {
+                alert("文档 " + doc.name + " 的首帧锚点超出画布宽度");
+                return false;
+            }
+            if (!globalSettings.needFixedPivotCrop && usesLastPivot && globalSettings.customLastFramePivotX > doc.width.value)
+            {
+                alert("文档 " + doc.name + " 的尾帧锚点超出画布宽度");
+                return false;
+            }
+            if (!globalSettings.needFixedPivotCrop && !globalSettings.needAutoCrop && !usesFirstPivot && !usesLastPivot)
+            {
+                try
+                {
+                    var selectionBounds = doc.selection.bounds;
+                }
+                catch (e)
+                {
+                    alert("未启用自动裁剪，但文档 " + doc.name + " 没有选区，请先手动框选选区");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    finally
+    {
+        app.preferences.rulerUnits = previousRulerUnits;
+    }
 }
 
 // 获取选取中心点
@@ -277,8 +388,8 @@ function ManualCropCurrentDocument(doc, needHorizontalScaling, needVerticalScali
     var bottomBound = manualBounds[3].value;
     
      // 获取当前文档宽度和高度
-    var docWidth = doc.width;
-    var docHeight = doc.height;
+    var docWidth = doc.width.value;
+    var docHeight = doc.height.value;
 
     // 当前图层的边界最大位置
     var currentLayer = doc.activeLayer;
@@ -318,18 +429,12 @@ function ManualCropCurrentDocument(doc, needHorizontalScaling, needVerticalScali
     // 是否水平方向扩展
     if(needHorizontalScaling)
     {
-        var leftDifference= Math.abs(leftBound - currentLayerLeftMinPosition);
-        var rightDifference = Math.abs(currentLayerRightMaxPosition- rightBound)
-        if(leftDifference > rightDifference)
-        {
-            finalCropLeftPosition = currentLayerLeftMinPosition;
-            finalCropRightPosition = rightBound + leftDifference;
-        }
-        else
-        {
-            finalCropLeftPosition = leftBound - rightDifference;
-            finalCropRightPosition = currentLayerRightMaxPosition;
-        }
+        var horizontalHalfSize = Math.max(
+            center.x - currentLayerLeftMinPosition,
+            currentLayerRightMaxPosition - center.x
+        );
+        finalCropLeftPosition = center.x - horizontalHalfSize;
+        finalCropRightPosition = center.x + horizontalHalfSize;
     }
     else
     {
@@ -340,18 +445,12 @@ function ManualCropCurrentDocument(doc, needHorizontalScaling, needVerticalScali
     // 是否垂直方向扩展
     if(needVerticalScaling)
     {
-        var topDifference= Math.abs(currentLayerTopMinPositon - topBound);
-        var bottomDifference = Math.abs(bottomBound - currentLayerBottomMaxPosition)
-        if(topDifference > bottomDifference)
-        {
-            finalCropToptPosition = currentLayerTopMinPositon;
-            finalCropBottomPosition = bottomBound + topDifference;
-        }
-        else
-        {
-            finalCropToptPosition = topBound + bottomDifference;
-            finalCropBottomPosition = currentLayerBottomMaxPosition;
-        }
+        var verticalHalfSize = Math.max(
+            center.y - currentLayerTopMinPositon,
+            currentLayerBottomMaxPosition - center.y
+        );
+        finalCropToptPosition = center.y - verticalHalfSize;
+        finalCropBottomPosition = center.y + verticalHalfSize;
     }
     else
     {
@@ -360,26 +459,10 @@ function ManualCropCurrentDocument(doc, needHorizontalScaling, needVerticalScali
     }
 
     // 写入.csv文件
-    var offsetX, offsetY;
-    if(preCenter==null) 
-    {
-        offsetX = 0; 
-        offsetY = 0;
-    }
-    else
-    {
-        offsetX = center.x - preCenter.x;
-        offsetY = center.y - preCenter.y;
-    }
-    // 根据角色的左右朝向，决定偏移值的正负，保证偏移值的正始终代表着角色的“正面”前进方向，负代表角色的“背后”后退方向
-    if(faceLeft)
-    {
-        offsetX = -offsetX;
-        offsetY = -offsetY;
-    }
+    var offset = CalculateOffset(center, preCenter, faceLeft);
     if(needExportCSVFile)
     {
-        csvFile.writeln(doc.name + "," + center.x + "," + center.y + "," + offsetX + "," + offsetY);
+        WriteCSVRow(csvFile, doc.name, center, offset);
     }
 
     cropRegion = [finalCropLeftPosition, finalCropToptPosition, finalCropRightPosition, finalCropBottomPosition];
@@ -392,8 +475,8 @@ function ManualCropCurrentDocument(doc, needHorizontalScaling, needVerticalScali
 function BipedAutoCropCurrentDocument(doc, isBottomCenter, toleranceOfBottom, needExportCSVFile, csvFile, preCenter, faceLeft, needDrawGuideLine) 
 {
     // 获取当前文档宽度和高度
-    var docWidth = doc.width;
-    var docHeight = doc.height;
+    var docWidth = doc.width.value;
+    var docHeight = doc.height.value;
 
     // 获取当前图层
     var currentLayer = doc.activeLayer;
@@ -423,37 +506,53 @@ function BipedAutoCropCurrentDocument(doc, isBottomCenter, toleranceOfBottom, ne
     doc.activeLayer = duplLayer;
     var tempLayer = doc.activeLayer;
     
-    // 根据锚点居中方式以及底部/顶部 容忍度获取选区
-    var selectionRegion;
+    // 以实际内容边界为基准，仅保留顶部或底部指定高度的像素带
+    var contentHeight = currentLayerBottomMaxPosition - currentLayerTopMinPositon;
+    var sampleHeight = Math.min(toleranceOfBottom, contentHeight);
+    var clearTop;
+    var clearBottom;
     if(isBottomCenter)
     {
-        selectionRegion= [
-            [0, 0],
-            [docWidth, 0], 
-            [docWidth, docHeight - toleranceOfBottom],
-            [0, docHeight - toleranceOfBottom]
-        ];
+        clearTop = 0;
+        clearBottom = currentLayerBottomMaxPosition - sampleHeight;
     }
     else
     {
-        selectionRegion= [
-            [0, docHeight - toleranceOfBottom],
-            [docWidth, docHeight - toleranceOfBottom], 
-            [0, docHeight],
-            [docWidth, docHeight]
-        ];
+        clearTop = currentLayerTopMinPositon + sampleHeight;
+        clearBottom = docHeight;
     }
-    var type = SelectionType.REPLACE;
-    var feather = 0;    // 羽化值
-    var antiAlias = false;  // 是否抗锯齿
-    doc.selection.select(selectionRegion, type, feather, antiAlias); // 创建矩形选区
-    doc.selection.clear();
-    doc.selection.deselect();
 
-    var leftBound = doc.activeLayer.bounds[0].value;
-    var topBound = doc.activeLayer.bounds[1].value;
-    var rightBound = doc.activeLayer.bounds[2].value;
-    var bottomBound = doc.activeLayer.bounds[3].value;
+    var sampledBounds;
+    try
+    {
+        if (clearBottom > clearTop)
+        {
+            var selectionRegion = [
+                [0, clearTop],
+                [docWidth, clearTop],
+                [docWidth, clearBottom],
+                [0, clearBottom]
+            ];
+            doc.selection.select(selectionRegion, SelectionType.REPLACE, 0, false);
+            doc.selection.clear();
+            doc.selection.deselect();
+        }
+
+        sampledBounds = tempLayer.bounds;
+        if (sampledBounds[0].value == sampledBounds[2].value || sampledBounds[1].value == sampledBounds[3].value)
+            throw new Error("指定的顶部/底部范围内没有可识别的像素");
+    }
+    catch (e)
+    {
+        try { tempLayer.remove(); } catch (removeError) {}
+        doc.activeLayer = currentLayer;
+        throw new Error("文档 " + doc.name + " 自动检测失败: " + e.message);
+    }
+
+    var leftBound = sampledBounds[0].value;
+    var topBound = sampledBounds[1].value;
+    var rightBound = sampledBounds[2].value;
+    var bottomBound = sampledBounds[3].value;
 
     if(needDrawGuideLine)
     {
@@ -461,12 +560,8 @@ function BipedAutoCropCurrentDocument(doc, isBottomCenter, toleranceOfBottom, ne
         var guideRightBottomcrop =doc.guides.add(Direction.VERTICAL, new UnitValue(rightBound, "px"));
     }
 
-    try {
-        tempLayer.remove();
-    } catch (e) {
-        alert("无法删除图层: " + e.message + "\n" + e.stack);
-        return;
-    }
+    tempLayer.remove();
+    doc.activeLayer = currentLayer;
 
      // 定义裁剪区域
     var cropRegion; 
@@ -476,46 +571,23 @@ function BipedAutoCropCurrentDocument(doc, isBottomCenter, toleranceOfBottom, ne
     var finalCropToptPosition;
     var finalCropBottomPosition;
     
-    var leftDifference= Math.abs(leftBound - currentLayerLeftMinPosition);
-    var rightDifference = Math.abs(currentLayerRightMaxPosition- rightBound)
-    
-    // 计算最终的裁剪区域位置
-    if(leftDifference > rightDifference)
-    {
-        finalCropLeftPosition = currentLayerLeftMinPosition;
-        finalCropRightPosition = rightBound + leftDifference;
-    }
-    else
-    {
-        finalCropLeftPosition = leftBound - rightDifference;
-        finalCropRightPosition = currentLayerRightMaxPosition;
-    }
+    var detectedCenterX = (leftBound + rightBound) * 0.5;
+    var horizontalHalfSize = Math.max(
+        detectedCenterX - currentLayerLeftMinPosition,
+        currentLayerRightMaxPosition - detectedCenterX
+    );
+    finalCropLeftPosition = detectedCenterX - horizontalHalfSize;
+    finalCropRightPosition = detectedCenterX + horizontalHalfSize;
     finalCropToptPosition = currentLayerTopMinPositon;
     finalCropBottomPosition = currentLayerBottomMaxPosition;
 
     cropRegion = [finalCropLeftPosition, finalCropToptPosition, finalCropRightPosition, finalCropBottomPosition];
 
     var center =  {x: (finalCropLeftPosition + finalCropRightPosition) * 0.5, y: (finalCropToptPosition + finalCropBottomPosition) * 0.5};
-    var offsetX, offsetY;
-    if(preCenter==null)
-    {
-        offsetX = 0;
-        offsetY = 0;
-    } 
-    else
-    {
-        offsetX = center.x - preCenter.x;
-        offsetY = center.y - preCenter.y;
-    }
-    // 根据角色的左右朝向，决定偏移值的正负，保证偏移值的正始终代表着角色的“正面”前进方向，负代表角色的“背后”后退方向
-    if(faceLeft)
-    {
-        offsetX = -offsetX;
-        offsetY = -offsetY;
-    }
+    var offset = CalculateOffset(center, preCenter, faceLeft);
     if(needExportCSVFile)
     {
-        csvFile.writeln(doc.name + "," + center.x  + "," + center.y + "," + offsetX + "," + offsetY);
+        WriteCSVRow(csvFile, doc.name, center, offset);
     }
     
     // 设置裁剪区域
@@ -527,8 +599,8 @@ function BipedAutoCropCurrentDocument(doc, isBottomCenter, toleranceOfBottom, ne
 function CropByFixedPivot(doc, pivotX, needExportCSVFile, csvFile, preCenter, faceLeft, needDrawGuideLine)
 {
     // 获取当前文档宽度和高度
-    var docWidth = doc.width;
-    var docHeight = doc.height;
+    var docWidth = doc.width.value;
+    var docHeight = doc.height.value;
 
     // 获取当前图层
     var currentLayer = doc.activeLayer;
@@ -563,26 +635,10 @@ function CropByFixedPivot(doc, pivotX, needExportCSVFile, csvFile, preCenter, fa
 
     // 记录中心点和偏移写入.csv文件
     var center =  {x: pivotX, y: (cropTop + cropBottom) * 0.5};
-    var offsetX, offsetY;
-    if(preCenter==null) 
-    {
-        offsetX = 0; 
-        offsetY = 0;
-    }
-    else
-    {
-        offsetX = center.x - preCenter.x;
-        offsetY = center.y - preCenter.y;
-    }
-    // 根据角色的左右朝向，决定偏移值的正负，保证偏移值的正始终代表着角色的“正面”前进方向，负代表角色的“背后”后退方向
-    if(faceLeft)
-    {
-        offsetX = -offsetX;
-        offsetY = -offsetY;
-    }
+    var offset = CalculateOffset(center, preCenter, faceLeft);
     if(needExportCSVFile)
     {
-        csvFile.writeln(doc.name + "," + center.x + "," + center.y + "," + offsetX + "," + offsetY);
+        WriteCSVRow(csvFile, doc.name, center, offset);
     }
 
     doc.crop([cropLeft, cropTop, cropRight, cropBottom], 0);
@@ -600,4 +656,23 @@ function SaveDocument(doc)
     {
         alert("保存文档失败: " + e.message);
     }
+}
+
+function CalculateOffset(center, preCenter, faceLeft)
+{
+    var offsetX = preCenter == null ? 0 : center.x - preCenter.x;
+    var offsetY = preCenter == null ? 0 : center.y - preCenter.y;
+    // 左右朝向只改变水平轴的正方向，不影响垂直方向
+    if (faceLeft) offsetX = -offsetX;
+    return {x: offsetX, y: offsetY};
+}
+
+function EscapeCSVField(value)
+{
+    return "\"" + String(value).replace(/\"/g, "\"\"") + "\"";
+}
+
+function WriteCSVRow(csvFile, docName, center, offset)
+{
+    csvFile.writeln(EscapeCSVField(docName) + "," + center.x + "," + center.y + "," + offset.x + "," + offset.y);
 }
